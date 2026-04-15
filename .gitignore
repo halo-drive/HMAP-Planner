@@ -4,28 +4,21 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-/planner_env 
+/planner_env
 
-# Python .pth files
-*.pth
-*.pt
-
-#video files 
+# video files
 *.mp4
 
-#data
+# data
 data/
 
-
-# image files  
+# image files
 *.png
 *.jpg
 *.jpeg
 
-# output directory
+# outputs only
 outputs/*.onnx
-
-# Ignore large models and logs
-*.onnx
 outputs/*.pth
+outputs/*.pt
 outputs/*.mp4
