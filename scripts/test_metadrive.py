@@ -5,18 +5,27 @@ Runs the trained planner in MetaDrive simulator:
   1. Reads ego/traffic/lane state from MetaDrive (replaces FusionEngine)
   2. Converts to planner input tensors (same format as FusedPacket)
   3. Runs inference through best_planner.pt
-  4. Converts output waypoints to steering/throttle via pure pursuit
+  4. Converts output waypoints to steering/throttle via the HMAP Controller
+     (kinematic bicycle tracker + meta-action gate + planner-sanity stack)
   5. Steps the simulator — full closed loop
+
+The planner output contract is NOT modified. All trajectory-to-control logic
+lives in hmap_controller.HMAPController, which mirrors the on-vehicle HMAP
+Controller wrapper that drives the Sygnal DBW interface. The legacy pure-pursuit
+function waypoints_to_action() is retained only for --compare A/B baselining.
 
 Usage:
     # 3D rendered window (needs display)
     python scripts/test_metadrive.py --checkpoint checkpoints/best_planner.pt --render
 
-    # Top-down view saved to video
-    python scripts/test_metadrive.py --checkpoint checkpoints/best_planner.pt --topdown
-
     # Headless (metrics only)
     python scripts/test_metadrive.py --checkpoint checkpoints/best_planner.pt
+
+    # A/B: legacy pure-pursuit vs HMAP Controller on identical seeds
+    python scripts/test_metadrive.py --checkpoint checkpoints/best_planner.pt --compare
+
+    # Tune longitudinal gain
+    python scripts/test_metadrive.py --checkpoint checkpoints/best_planner.pt --kp 0.2
 """
 
 import argparse
@@ -33,6 +42,10 @@ from halo_planner.model import (
     HaloPlanner, MAX_OBJECTS, MAX_LANES, MAX_LANE_POINTS,
     TRAJECTORY_STEPS, WAYPOINT_DIM, NUM_META_ACTIONS, META_ACTIONS,
 )
+
+# HMAP Controller — kinematic trajectory controller (drop next to this script,
+# or anywhere on PYTHONPATH).
+from hmap_controller import HMAPController
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +254,8 @@ def scene_to_tensors(env, device):
 
 
 # ---------------------------------------------------------------------------
-# Trajectory → MetaDrive action (pure pursuit controller)
+# LEGACY controller — retained ONLY as the --compare baseline.
+# The HMAP Controller (hmap_controller.py) is the real controller.
 # ---------------------------------------------------------------------------
 def waypoints_to_action(waypoints, agent, lookahead_index=8):
     # Speed-adaptive lookahead
@@ -280,8 +294,128 @@ def waypoints_to_action(waypoints, agent, lookahead_index=8):
 
     return [float(steering), float(throttle)]
 
+
 # ---------------------------------------------------------------------------
-# Main closed-loop evaluation
+# Single-episode runner — used by both normal and --compare modes.
+# `controller_kind` is "hmap" or "legacy". Returns a result dict.
+# ---------------------------------------------------------------------------
+def run_episode(env, model, device, args, controller_kind, dt, verbose=True):
+    obs, info = env.reset()
+
+    # Build the controller for this episode.
+    hmap = None
+    if controller_kind == "hmap":
+        hmap = HMAPController(env.agent, kp=args.kp,
+                              enable_rollout_check=args.rollout_check)
+
+    total_distance = 0.0
+    total_reward = 0.0
+    collisions = 0
+    steps = 0
+    out_of_road = False
+    reached_dest = False
+    current_waypoints = None
+    current_meta_logits = None
+    plan_count = 0
+    inference_times = []
+    # Sanity-verdict counters (HMAP only).
+    verdict_counts = {"ok": 0, "clamp": 0, "reject": 0}
+    clamp_reasons = {}
+
+    last_pos = np.array(env.agent.position, dtype=np.float64)
+
+    for step in range(args.max_steps):
+        # --- Re-plan at 10Hz (every replan_every sim steps) ---
+        if step % args.replan_every == 0:
+            with torch.no_grad():
+                t0 = time.time()
+                inputs = scene_to_tensors(env, device)
+                out = model(**inputs)
+                dt_inf = time.time() - t0
+                inference_times.append(dt_inf * 1000)
+
+            current_waypoints = out["waypoints"][0].cpu().numpy()  # (40, 4)
+            current_meta_logits = out["meta_logits"][0].cpu().numpy()  # (6,)
+            plan_count += 1
+
+        # --- Convert waypoints to steering/throttle ---
+        if current_waypoints is not None:
+            if controller_kind == "hmap":
+                action = hmap.compute_action(
+                    current_waypoints, current_meta_logits, env.agent, dt=dt
+                )
+                v, reason, streak = hmap.last_verdict
+                verdict_counts[v] = verdict_counts.get(v, 0) + 1
+                if v == "clamp" and reason:
+                    clamp_reasons[reason] = clamp_reasons.get(reason, 0) + 1
+                if verbose and v != "ok" and step % args.replan_every == 0:
+                    print(f"  [sanity] step {step:4d}: {v} ({reason}) streak={streak}")
+            else:
+                action = waypoints_to_action(current_waypoints, env.agent)
+        else:
+            action = [0.0, 0.0]
+
+        # --- Step simulator ---
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        # --- Track metrics ---
+        current_pos = np.array(env.agent.position, dtype=np.float64)
+        total_distance += np.linalg.norm(current_pos - last_pos)
+        total_reward += reward
+        last_pos = current_pos
+        steps += 1
+
+        if info.get("crash_vehicle", False) or info.get("crash_object", False):
+            collisions += 1
+
+        if args.topdown:
+            env.render(mode="topdown", window=True, screen_size=(600, 600),
+                       screen_record=args.save_video is not None)
+
+        if terminated or truncated:
+            reached_dest = info.get("arrive_dest", False)
+            out_of_road = info.get("out_of_road", False)
+            break
+
+    route_completion = env.agent.navigation.route_completion
+    avg_inference = np.mean(inference_times) if inference_times else 0
+
+    return {
+        "controller": controller_kind,
+        "steps": steps,
+        "distance_m": total_distance,
+        "reward": total_reward,
+        "collisions": collisions,
+        "route_completion": route_completion,
+        "reached_dest": reached_dest,
+        "out_of_road": out_of_road,
+        "avg_inference_ms": avg_inference,
+        "num_replans": plan_count,
+        "verdict_counts": verdict_counts,
+        "clamp_reasons": clamp_reasons,
+    }
+
+
+def print_episode(result, ep, n):
+    status = ("ARRIVED" if result["reached_dest"]
+              else "OUT OF ROAD" if result["out_of_road"]
+              else "CRASHED" if result["collisions"] > 0
+              else "TIMEOUT")
+    print(f"\n  [{result['controller']}] Episode {ep+1}/{n}: {status}")
+    print(f"    Distance:         {result['distance_m']:.1f}m")
+    print(f"    Route completion: {result['route_completion'] * 100:.1f}%")
+    print(f"    Collisions:       {result['collisions']}")
+    print(f"    Avg inference:    {result['avg_inference_ms']:.1f}ms")
+    if result["controller"] == "hmap":
+        vc = result["verdict_counts"]
+        print(f"    Sanity:           ok={vc.get('ok',0)} "
+              f"clamp={vc.get('clamp',0)} reject={vc.get('reject',0)}")
+        if result["clamp_reasons"]:
+            print(f"    Clamp reasons:    {result['clamp_reasons']}")
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="HALO Planner — MetaDrive Test")
@@ -296,6 +430,16 @@ def main():
                         help="Map layout: S=straight, C=curve, X=intersection, O=roundabout, T=T-junction")
     parser.add_argument("--traffic_density", type=float, default=0.3)
     parser.add_argument("--save_video", type=str, default=None, help="Path to save top-down video")
+    # --- HMAP Controller options ---
+    parser.add_argument("--kp", type=float, default=0.2,
+                        help="Longitudinal PID proportional gain (tune this first)")
+    parser.add_argument("--rollout_check", action="store_true",
+                        help="Enable advisory forward-rollout divergence check (Concern B)")
+    parser.add_argument("--compare", action="store_true",
+                        help="Run legacy pure-pursuit AND HMAP Controller on identical seeds")
+    parser.add_argument("--controller", type=str, default="hmap",
+                        choices=["hmap", "legacy"],
+                        help="Which controller to use when not in --compare mode")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -310,6 +454,10 @@ def main():
     print(f"  Model loaded (epoch {ckpt['epoch']}, val ADE: {ckpt.get('val_ade', '?')}m)")
     print(f"  Parameters: {model.count_parameters() / 1e6:.1f}M")
 
+    # --- Sim tick period for the PID. sim≈40Hz with replan_every=4 -> 10Hz plan.
+    # The control action is applied every sim step, so dt = 1/40 = 0.025s.
+    dt = 0.025
+
     # --- Create environment ---
     from metadrive.envs.metadrive_env import MetaDriveEnv
 
@@ -318,129 +466,33 @@ def main():
         use_render=args.render,
         num_scenarios=args.num_scenarios,
         traffic_density=args.traffic_density,
-        start_seed=42,
+        start_seed=42,   # fixed seed base -> identical scenarios across controllers
     )
 
     print(f"\nCreating MetaDrive environment...")
-    print(f"  Map: {args.map}")
-    print(f"  Traffic density: {args.traffic_density}")
-    print(f"  Render: {'3D' if args.render else 'topdown' if args.topdown else 'headless'}")
+    print(f"  Map: {args.map} | Traffic: {args.traffic_density} | "
+          f"Render: {'3D' if args.render else 'topdown' if args.topdown else 'headless'}")
+    if args.compare:
+        print(f"  Mode: COMPARE (legacy vs hmap), kp={args.kp}")
+    else:
+        print(f"  Mode: {args.controller.upper()}, kp={args.kp}")
     env = MetaDriveEnv(env_config)
 
     # --- Run episodes ---
-    all_results = []
+    # In compare mode we run each scenario twice (same seed) — once per
+    # controller — so the only variable is the controller.
+    kinds = ["legacy", "hmap"] if args.compare else [args.controller]
+    results = {k: [] for k in kinds}
 
     for ep in range(args.num_scenarios):
-        obs, info = env.reset()
+        print(f"\n{'='*52}\nScenario {ep + 1}/{args.num_scenarios}\n{'='*52}")
+        for kind in kinds:
+            # reset() with the same episode index reproduces the same scenario
+            # because start_seed is fixed and num_scenarios bounds the seed set.
+            res = run_episode(env, model, device, args, kind, dt, verbose=not args.compare)
+            results[kind].append(res)
+            print_episode(res, ep, args.num_scenarios)
 
-        total_distance = 0.0
-        total_reward = 0.0
-        collisions = 0
-        steps = 0
-        out_of_road = False
-        reached_dest = False
-        current_waypoints = None
-        plan_count = 0
-        inference_times = []
-
-        last_pos = np.array(env.agent.position, dtype=np.float64)
-
-        print(f"\n{'='*50}")
-        print(f"Episode {ep + 1}/{args.num_scenarios}")
-        print(f"{'='*50}")
-
-        for step in range(args.max_steps):
-            # --- Re-plan at 10Hz (every replan_every sim steps) ---
-            if step % args.replan_every == 0:
-                with torch.no_grad():
-                    t0 = time.time()
-                    inputs = scene_to_tensors(env, device)
-                    out = model(**inputs)
-                    dt = time.time() - t0
-                    inference_times.append(dt * 1000)
-                
-                current_waypoints = out["waypoints"][0].cpu().numpy()  # (40, 4)
-                meta_idx = out["meta_logits"][0].argmax().item()
-                plan_count += 1
-
-                if step % (args.replan_every * 20) == 0:
-                    n_obj = inputs["object_mask"][0].sum().item()
-                    n_lane = inputs["lane_mask"][0].sum().item()
-                    speed = np.linalg.norm(env.agent.velocity)
-                    wp = current_waypoints
-                    print(f"  Step {step:4d} | Speed: {speed:.1f} m/s | "
-                          f"Objects: {n_obj:.0f} | Lanes: {n_lane:.0f} | "
-                          f"Action: {META_ACTIONS[meta_idx]} | "
-                          f"Inference: {dt*1000:.1f}ms")
-                    print(f"    WP[0]:  x={wp[0,0]:+.3f} y={wp[0,1]:+.3f} vel={wp[0,3]:.2f}")
-                    print(f"    WP[5]:  x={wp[5,0]:+.3f} y={wp[5,1]:+.3f} vel={wp[5,3]:.2f}")
-                    print(f"    WP[20]: x={wp[20,0]:+.3f} y={wp[20,1]:+.3f} vel={wp[20,3]:.2f}")
-                    print(f"    WP[39]: x={wp[39,0]:+.3f} y={wp[39,1]:+.3f} vel={wp[39,3]:.2f}")
-                    action_preview = waypoints_to_action(current_waypoints, env.agent)
-                    print(f"    Action: steer={action_preview[0]:+.3f} throttle={action_preview[1]:+.3f}")
-
-            # --- Convert waypoints to steering/throttle ---
-            if current_waypoints is not None:
-                action = waypoints_to_action(current_waypoints, env.agent)
-            else:
-                action = [0.0, 0.0]
-
-            # --- Step simulator ---
-            obs, reward, terminated, truncated, info = env.step(action)
-
-            # --- Track metrics ---
-            current_pos = np.array(env.agent.position, dtype=np.float64)
-            step_dist = np.linalg.norm(current_pos - last_pos)
-            total_distance += step_dist
-            total_reward += reward
-            last_pos = current_pos
-            steps += 1
-
-            if info.get("crash_vehicle", False) or info.get("crash_object", False):
-                collisions += 1
-
-            # --- Render top-down if requested ---
-            if args.topdown:
-                env.render(
-                    mode="topdown",
-                    window=True,
-                    screen_size=(600, 600),
-                    screen_record=args.save_video is not None,
-                )
-
-            if terminated or truncated:
-                reached_dest = info.get("arrive_dest", False)
-                out_of_road = info.get("out_of_road", False)
-                break
-
-        # --- Episode summary ---
-        route_completion = env.agent.navigation.route_completion
-        avg_inference = np.mean(inference_times) if inference_times else 0
-
-        result = {
-            "episode": ep + 1,
-            "steps": steps,
-            "distance_m": total_distance,
-            "reward": total_reward,
-            "collisions": collisions,
-            "route_completion": route_completion,
-            "reached_dest": reached_dest,
-            "out_of_road": out_of_road,
-            "avg_inference_ms": avg_inference,
-            "num_replans": plan_count,
-        }
-        all_results.append(result)
-
-        status = "ARRIVED" if reached_dest else "OUT OF ROAD" if out_of_road else "TIMEOUT" if steps >= args.max_steps else "CRASHED"
-        print(f"\n  Result: {status}")
-        print(f"  Distance:         {total_distance:.1f}m")
-        print(f"  Route completion: {route_completion * 100:.1f}%")
-        print(f"  Collisions:       {collisions}")
-        print(f"  Reward:           {total_reward:.2f}")
-        print(f"  Avg inference:    {avg_inference:.1f}ms")
-        print(f"  Re-plans:         {plan_count}")
-
-    # Save top-down video if requested
     if args.topdown and args.save_video:
         try:
             env.top_down_renderer.generate_gif(args.save_video)
@@ -450,22 +502,41 @@ def main():
 
     env.close()
 
-    # --- Final summary ---
-    print(f"\n{'='*50}")
-    print(f"SUMMARY ({len(all_results)} episodes)")
-    print(f"{'='*50}")
+    # --- Summary ---
+    print(f"\n{'='*52}\nSUMMARY ({args.num_scenarios} scenarios)\n{'='*52}")
 
-    avg_dist = np.mean([r["distance_m"] for r in all_results])
-    avg_route = np.mean([r["route_completion"] for r in all_results])
-    total_collisions = sum(r["collisions"] for r in all_results)
-    arrivals = sum(1 for r in all_results if r["reached_dest"])
-    avg_infer = np.mean([r["avg_inference_ms"] for r in all_results])
+    def summarise(rs):
+        return {
+            "dist": np.mean([r["distance_m"] for r in rs]),
+            "route": np.mean([r["route_completion"] for r in rs]) * 100,
+            "coll": sum(r["collisions"] for r in rs),
+            "arr": sum(1 for r in rs if r["reached_dest"]),
+            "infer": np.mean([r["avg_inference_ms"] for r in rs]),
+        }
 
-    print(f"  Avg distance:     {avg_dist:.1f}m")
-    print(f"  Avg route:        {avg_route * 100:.1f}%")
-    print(f"  Total collisions: {total_collisions}")
-    print(f"  Arrivals:         {arrivals}/{len(all_results)}")
-    print(f"  Avg inference:    {avg_infer:.1f}ms ({1000/max(avg_infer, 1):.0f} Hz)")
+    if args.compare:
+        L, H = summarise(results["legacy"]), summarise(results["hmap"])
+        # Aggregate HMAP sanity verdicts across episodes.
+        agg = {"ok": 0, "clamp": 0, "reject": 0}
+        for r in results["hmap"]:
+            for k, v in r["verdict_counts"].items():
+                agg[k] = agg.get(k, 0) + v
+        print(f"  {'metric':<20}{'legacy':>12}{'hmap':>12}")
+        print(f"  {'-'*44}")
+        print(f"  {'avg distance (m)':<20}{L['dist']:>12.1f}{H['dist']:>12.1f}")
+        print(f"  {'avg route (%)':<20}{L['route']:>12.1f}{H['route']:>12.1f}")
+        print(f"  {'total collisions':<20}{L['coll']:>12d}{H['coll']:>12d}")
+        print(f"  {'arrivals':<20}{L['arr']:>12d}{H['arr']:>12d}")
+        print(f"  {'avg inference (ms)':<20}{L['infer']:>12.1f}{H['infer']:>12.1f}")
+        print(f"\n  HMAP sanity totals: {agg}")
+    else:
+        S = summarise(results[args.controller])
+        print(f"  Controller:       {args.controller}")
+        print(f"  Avg distance:     {S['dist']:.1f}m")
+        print(f"  Avg route:        {S['route']:.1f}%")
+        print(f"  Total collisions: {S['coll']}")
+        print(f"  Arrivals:         {S['arr']}/{args.num_scenarios}")
+        print(f"  Avg inference:    {S['infer']:.1f}ms ({1000/max(S['infer'],1):.0f} Hz)")
 
 
 if __name__ == "__main__":

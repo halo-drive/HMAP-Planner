@@ -5,3 +5,29 @@ python scripts/test_metadrive.py \
     --traffic_density 0.1 \
     --num_scenarios 1 \
     --max_steps 3000
+
+python scripts/test_metadrive.py \
+    --checkpoint checkpoints/best_planner.pt \
+    --map SCCS --num_scenarios 10 --kp 0.2
+
+
+python scripts/test_metadrive.py \
+    --checkpoint checkpoints/best_planner.pt \
+    --map SCCS --num_scenarios 10 --compare
+
+
+
+python scripts/test_metadrive.py --checkpoint checkpoints/best_planner.pt \
+    --map XOT --num_scenarios 5 --controller hmap
+
+
+
+python scripts/test_metadrive.py \
+    --checkpoint checkpoints/best_planner.pt \
+    --render \
+    --map SCCS \
+    --traffic_density 0.2 \
+    --num_scenarios 1 \
+    --max_steps 3000 \
+    --controller hmap \
+    --kp 0.2
