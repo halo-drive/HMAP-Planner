@@ -296,11 +296,97 @@ def waypoints_to_action(waypoints, agent, lookahead_index=8):
 
 
 # ---------------------------------------------------------------------------
+# Debug-frame dump — print planner INPUTS (what it saw) and OUTPUTS (what it
+# produced) side by side, to localise plumbing bug vs closed-loop gap.
+# ---------------------------------------------------------------------------
+def _dump_debug_frame(env, inputs, waypoints, meta_logits, step, plan_count):
+    agent = env.agent
+    print(f"\n  ---- DEBUG FRAME (plan #{plan_count}, sim step {step}) ----")
+
+    # === GROUND TRUTH from MetaDrive ===
+    pos = np.array(agent.position)
+    print(f"  [truth] ego world pos={pos.round(2)} heading={agent.heading_theta:+.3f} "
+          f"speed={np.linalg.norm(agent.velocity):.2f} m/s")
+    # Lateral offset from lane centre + lane heading — the on-road reference.
+    try:
+        lane = agent.lane
+        long, lat = lane.local_coordinates(agent.position)
+        lane_heading = lane.heading_theta_at(long)
+        print(f"  [truth] lane lateral offset={lat:+.2f}m (0=centre)  "
+              f"lane heading={lane_heading:+.3f}  rel={_wrap(lane_heading-agent.heading_theta):+.3f}")
+    except Exception as e:
+        print(f"  [truth] lane query failed: {e}")
+
+    # === INPUTS the planner received ===
+    ego_in = inputs["ego_state"][0].cpu().numpy()
+    objs = inputs["objects"][0].cpu().numpy()
+    obj_m = inputs["object_mask"][0].cpu().numpy()
+    lanes = inputs["lanes"][0].cpu().numpy()
+    lane_m = inputs["lane_mask"][0].cpu().numpy()
+    nav = inputs["nav_command"][0].cpu().numpy()
+    print(f"  [in] ego_state={ego_in.round(2)}")
+    print(f"  [in] n_objects={int(obj_m.sum())}  n_lanes={int(lane_m.sum())}  "
+          f"nav={nav.round(1)} (L,S,R)")
+    # Lane y-signs: on a straight road the nearest lane centre should bracket
+    # the ego symmetrically; a consistent y-sign reveals a frame flip on input.
+    if lane_m.sum() > 0:
+        first_lane = lanes[np.argmax(lane_m)]
+        pts = first_lane[:40].reshape(-1, 2)  # MAX_LANE_POINTS x 2
+        print(f"  [in] lane0 ego-frame: x {pts[:,0].min():+.1f}..{pts[:,0].max():+.1f}  "
+              f"y {pts[:,1].min():+.1f}..{pts[:,1].max():+.1f}  "
+              f"(y~0 = lane runs ahead; y all one sign = offset/flip)")
+
+    # === OUTPUTS the planner produced ===
+    wp = waypoints
+    probs = np.exp(meta_logits) / np.exp(meta_logits).sum()
+    print(f"  [out] WP0=({wp[0,0]:+.1f},{wp[0,1]:+.1f}) "
+          f"WP20=({wp[20,0]:+.1f},{wp[20,1]:+.1f}) "
+          f"WP39=({wp[39,0]:+.1f},{wp[39,1]:+.1f})")
+    print(f"  [out] x {wp[:,0].min():+.1f}..{wp[:,0].max():+.1f}  "
+          f"y {wp[:,1].min():+.1f}..{wp[:,1].max():+.1f}  "
+          f"theta {wp[:,2].min():+.2f}..{wp[:,2].max():+.2f}  "
+          f"vel {wp[:,3].min():+.1f}..{wp[:,3].max():+.1f}")
+    meta_names = ["follow", "lc_left", "lc_right", "stop", "yield", "reverse"]
+    top = int(np.argmax(probs))
+    print(f"  [out] meta={meta_names[top]} ({probs[top]:.2f})  all={probs.round(2)}")
+    # Interpretation hint
+    fwd = wp[39, 0]
+    lat = wp[39, 1]
+    print(f"  [read] forward extent={fwd:+.1f}m over 4s -> implied {fwd/4:.1f} m/s; "
+          f"lateral drift at horizon={lat:+.1f}m "
+          f"({'RIGHT' if lat < -0.5 else 'LEFT' if lat > 0.5 else 'straight'})")
+    print(f"  -------------------------------------------------------")
+
+
+def _wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+# ---------------------------------------------------------------------------
 # Single-episode runner — used by both normal and --compare modes.
 # `controller_kind` is "hmap" or "legacy". Returns a result dict.
 # ---------------------------------------------------------------------------
 def run_episode(env, model, device, args, controller_kind, dt, verbose=True):
     obs, info = env.reset()
+
+    # --- Moving start (in-distribution hand-off) ---------------------------
+    # nuScenes training data essentially never contains a standstill on an empty
+    # road, so the planner cannot launch from 0 m/s (verified: y-drift -1.3m at
+    # 5 m/s vs -0.04m at 16 m/s). We drive open-loop with fixed throttle until
+    # the ego reaches ~warmup_speed, THEN hand control to the planner — so it
+    # operates in the speed regime it was trained on. This is a test-harness
+    # accommodation for a known training-data gap, not a model fix.
+    if args.warmup_speed > 0.0:
+        for _ in range(args.warmup_max_steps):
+            if np.linalg.norm(env.agent.velocity) >= args.warmup_speed:
+                break
+            obs, _, term, trunc, info = env.step([0.0, 1.0])  # straight, full throttle
+            if term or trunc:
+                obs, info = env.reset()
+                break
+        if verbose:
+            print(f"  [warmup] handing off to planner at "
+                  f"{np.linalg.norm(env.agent.velocity):.1f} m/s")
 
     # Build the controller for this episode.
     hmap = None
@@ -337,6 +423,12 @@ def run_episode(env, model, device, args, controller_kind, dt, verbose=True):
             current_waypoints = out["waypoints"][0].cpu().numpy()  # (40, 4)
             current_meta_logits = out["meta_logits"][0].cpu().numpy()  # (6,)
             plan_count += 1
+
+            # --- Debug-frame dump: inputs the planner SAW + outputs it PRODUCED.
+            # Settles plumbing-bug vs closed-loop-gap. Dumps the first few plans.
+            if args.debug_frame and plan_count <= args.debug_frame:
+                _dump_debug_frame(env, inputs, current_waypoints,
+                                  current_meta_logits, step, plan_count)
 
         # --- Convert waypoints to steering/throttle ---
         if current_waypoints is not None:
@@ -435,6 +527,14 @@ def main():
                         help="Longitudinal PID proportional gain (tune this first)")
     parser.add_argument("--rollout_check", action="store_true",
                         help="Enable advisory forward-rollout divergence check (Concern B)")
+    parser.add_argument("--debug-frame", type=int, default=0, dest="debug_frame",
+                        help="Dump planner inputs+outputs for the first N plans (0=off)")
+    parser.add_argument("--warmup-speed", type=float, default=12.0, dest="warmup_speed",
+                        help="Drive open-loop until ego reaches this speed (m/s) before "
+                             "handing to the planner (0=disable; nuScenes-trained planner "
+                             "cannot launch from standstill)")
+    parser.add_argument("--warmup-max-steps", type=int, default=60, dest="warmup_max_steps",
+                        help="Max sim steps to spend reaching warmup speed")
     parser.add_argument("--compare", action="store_true",
                         help="Run legacy pure-pursuit AND HMAP Controller on identical seeds")
     parser.add_argument("--controller", type=str, default="hmap",

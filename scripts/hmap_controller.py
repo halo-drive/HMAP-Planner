@@ -142,17 +142,26 @@ class PlannerSanityChecker:
         x = wp[:, 0]
         y = wp[:, 1]
 
-        # --- feasibility: velocity within [0, v_max] ---
+        # --- feasibility: velocity channel ---
+        # The velocity channel is NO LONGER USED by the controller (target speed
+        # is derived from waypoint positions). We still clip it for tidiness but
+        # do NOT flag it as a clamp reason — it was firing on ~every frame and
+        # is now irrelevant noise in the logs.
         v = wp[:, 3]
         if np.any(v < 0) or np.any(v > self.v_max):
             wp[:, 3] = np.clip(v, 0.0, self.v_max)
-            clamped = True
-            reasons.append("velocity")
+            # intentionally not setting clamped/reasons for velocity
 
-        # --- feasibility: curvature implies delta <= max_delta ---
-        # Discrete curvature from heading change per arc length:
-        #   kappa = dtheta / ds ; delta = atan(L * kappa)
-        # Clamp the implied curvature by limiting heading rate of change.
+        # --- feasibility: curvature (DIAGNOSTIC ONLY — does not rewrite theta) ---
+        # NOTE: the previous version reconstructed the heading channel by
+        # integrating a clamped curvature forward. That was harmful: it (a)
+        # accumulated a monotonic, single-sign heading error along the 40 wps,
+        # and (b) desynced theta from the untouched (x,y), so the heading
+        # feedforward injected a persistent steering bias -> the "drifts right
+        # and off road" symptom. We no longer rewrite theta. The lateral tracker
+        # steers on POSITION (pure pursuit); position is the feasibility-limiting
+        # signal and the actuator delta is already saturated to max_delta in the
+        # MotionModel. We only flag curvature for visibility.
         theta = wp[:, 2]
         ds = np.hypot(np.diff(x), np.diff(y))
         ds = np.clip(ds, 1e-3, None)
@@ -160,14 +169,11 @@ class PlannerSanityChecker:
         kappa = dtheta / ds
         max_kappa = math.tan(self.max_delta) / self.L
         if np.any(np.abs(kappa) > max_kappa):
-            # Clamp heading channel so implied curvature is feasible.
-            kappa_c = np.clip(kappa, -max_kappa, max_kappa)
-            theta_c = theta.copy()
-            for i in range(1, len(theta_c)):
-                theta_c[i] = theta_c[i - 1] + kappa_c[i - 1] * ds[i - 1]
-            wp[:, 2] = theta_c
-            clamped = True
-            reasons.append("curvature")
+            # Computed from the planner's theta channel, which is unreliable.
+            # Diagnostic-only and was flooding logs every frame. Do NOT flag —
+            # steering saturation in the tracker handles genuine infeasibility,
+            # and steering is driven by POSITIONS, not this curvature estimate.
+            pass
 
         if clamped:
             return ("clamp", wp, "+".join(reasons))
@@ -304,12 +310,14 @@ class TrajectoryTracker:
 
     def __init__(self, motion: MotionModel,
                  kp: float = 0.6, ki: float = 0.05, kd: float = 0.1,
-                 heading_ff_gain: float = 0.15,
-                 max_decel_target: float = 6.0):
+                 heading_ff_gain: float = 0.0,
+                 max_decel_target: float = 6.0,
+                 cruise_speed: float = 12.0):
         self.motion = motion
         self.kp, self.ki, self.kd = kp, ki, kd
         self.heading_ff_gain = heading_ff_gain
         self.max_decel_target = max_decel_target
+        self.cruise_speed = cruise_speed
 
         # PID state (persists across ticks)
         self._int = 0.0
@@ -324,30 +332,53 @@ class TrajectoryTracker:
         tx, ty = float(waypoints[idx, 0]), float(waypoints[idx, 1])
         delta = self.motion.pure_pursuit_delta(tx, ty)
 
-        # Heading feedforward: the planner's theta at the lookahead point is the
-        # path tangent. Nudge delta toward it — captures curvature that pure
-        # position pursuit lags on. Kept small so position tracking dominates.
-        path_theta = float(waypoints[idx, 2])
-        delta = delta + self.heading_ff_gain * _wrap_angle(path_theta)
+        # Heading feedforward: OFF by default (heading_ff_gain=0). The planner's
+        # theta channel was injecting a single-sign steering bias (drift off
+        # road). Until the theta convention is verified against the path tangent,
+        # steer on POSITION only — this is what the legacy controller did. Re-
+        # enable by passing heading_ff_gain>0 once theta is confirmed.
+        if self.heading_ff_gain != 0.0:
+            path_theta = float(waypoints[idx, 2])
+            delta = delta + self.heading_ff_gain * _wrap_angle(path_theta)
         return float(np.clip(delta, -max_delta, max_delta))
 
     # ---- longitudinal -----------------------------------------------------
     def _target_speed(self, waypoints: np.ndarray, idx: int, sched: dict) -> float:
-        # Feedforward: trust the planner's velocity channel at the lookahead wp.
-        v_plan = float(waypoints[idx, 3])
+        # CRITICAL: target speed must NOT be derived from the planner's forward
+        # extent. The extent is conditioned on the ego's CURRENT speed (planner
+        # predicts shorter trajectories when slower), so deriving target speed
+        # from it creates a destabilizing feedback loop: slower ego -> shorter
+        # prediction -> lower target -> brake -> slower ego -> ... collapsing to
+        # a standstill (observed: 12 -> 0 m/s in 20 steps on a straight road).
+        #
+        # Instead: hold a FIXED cruise speed, decoupled from the planner's
+        # longitudinal output. The planner is used for STEERING (path geometry),
+        # not speed. Slow ONLY for genuine path curvature (from positions, not
+        # the extent) and for meta-action guards.
+        v_target = self.cruise_speed
 
-        # Geometric sanity band: speed implied by how far the far waypoint is.
-        far_idx = min(39, len(waypoints) - 1)
-        far_dist = math.hypot(waypoints[far_idx, 0], waypoints[far_idx, 1])
-        v_geom = far_dist / ((far_idx + 1) * DT_WAYPOINT)
-        # Clamp planner v to [0, 1.5x geometric] — rejects a spuriously high v.
-        v_target = float(np.clip(v_plan, 0.0, 1.5 * max(v_geom, 0.1)))
+        # Path-shape slowdown: estimate how much the planned PATH bends over the
+        # lookahead window (from positions, independent of speed/extent). A
+        # sharper bend lowers the target proportionally.
+        n = len(waypoints)
+        a = min(idx, n - 1)
+        b = min(a + 10, n - 1)
+        if b > a + 1:
+            # Heading of path at start vs end of window, from positions.
+            h0 = math.atan2(waypoints[a + 1, 1] - waypoints[a, 1],
+                            waypoints[a + 1, 0] - waypoints[a, 0])
+            h1 = math.atan2(waypoints[b, 1] - waypoints[b - 1, 1],
+                            waypoints[b, 0] - waypoints[b - 1, 0])
+            bend = abs(_wrap_angle(h1 - h0))  # radians over ~1s of path
+            # Scale: 0 bend -> full cruise; ~0.5 rad bend -> ~half cruise.
+            slowdown = 1.0 / (1.0 + 2.0 * bend)
+            v_target *= slowdown
 
         # --- hard guards override ---
         if sched["stop"]:
             v_target = 0.0
         elif sched["yield_active"]:
-            v_target = min(v_target, 0.3 * v_geom)  # heavy slow, not full stop
+            v_target = min(v_target, 0.3 * self.cruise_speed)
         return v_target
 
     def _throttle(self, v_target: float, v_meas: float, dt: float) -> float:
@@ -404,12 +435,14 @@ class HMAPController:
 
     def __init__(self, agent, enable_rollout_check: bool = False,
                  grace_ticks: int = 8, v_max: float = 30.0,
-                 kp: float = 0.2, ki: float = 0.05, kd: float = 0.1):
+                 kp: float = 0.2, ki: float = 0.05, kd: float = 0.1,
+                 cruise_speed: float = 12.0):
         wheelbase = agent.FRONT_WHEELBASE + agent.REAR_WHEELBASE
         max_delta = math.radians(agent.max_steering)
         self.motion = MotionModel(wheelbase, max_delta)
         self.gate = MetaActionGate()
-        self.tracker = TrajectoryTracker(self.motion, kp=kp, ki=ki, kd=kd)
+        self.tracker = TrajectoryTracker(self.motion, kp=kp, ki=ki, kd=kd,
+                                         cruise_speed=cruise_speed)
         self.sanity = PlannerSanityChecker(wheelbase, max_delta, v_max=v_max)
         self.max_delta = max_delta
         self.enable_rollout_check = enable_rollout_check
