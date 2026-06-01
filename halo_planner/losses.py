@@ -32,6 +32,8 @@ class PlannerLoss(nn.Module):
         w_velocity: float = 0.2,
         w_meta: float = 0.5,
         w_coll: float = 1.0,
+        w_lane: float = 0.1,
+        lane_band: float = 1.75,
     ):
         super().__init__()
         self.w_traj = w_traj
@@ -39,6 +41,11 @@ class PlannerLoss(nn.Module):
         self.w_velocity = w_velocity
         self.w_meta = w_meta
         self.w_coll = w_coll
+        self.w_lane = w_lane
+        # Soft lane-keeping band (m): no penalty within this lateral distance of
+        # the nearest lane centerline; linear penalty beyond. ~half a 3.5m lane,
+        # so normal within-lane variation isn't penalised, only genuine departure.
+        self.lane_band = lane_band
         self.smooth_l1 = nn.SmoothL1Loss(reduction="mean", beta=1.0)
 
     @staticmethod
@@ -55,6 +62,8 @@ class PlannerLoss(nn.Module):
         waypoint_mask: torch.Tensor,      # (B, T) — True = valid timestep
         object_positions: torch.Tensor | None = None,   # (B, N, 2) for collision
         object_mask: torch.Tensor | None = None,         # (B, N)
+        lane_points: torch.Tensor | None = None,         # (B, M, MAX_LANE_POINTS*2) for lane-keeping
+        lane_mask: torch.Tensor | None = None,           # (B, M)
     ) -> dict[str, torch.Tensor]:
 
         # --- Position loss (x, y) ---
@@ -100,6 +109,39 @@ class PlannerLoss(nn.Module):
             violation = F.relu(collision_margin - min_dist)  # 0 if far, positive if close
             l_coll = (violation * waypoint_mask).sum() / waypoint_mask.sum().clamp(min=1)
 
+        # --- Lane-keeping penalty (optional) ---
+        # Penalise predicted waypoints that stray far from the nearest lane
+        # centerline point. Soft hinge: zero within `lane_band` metres, linear
+        # beyond. Distance is to the nearest of ALL valid lane points (no lane
+        # identity available), a good proxy on open road. Small weight so it
+        # shapes behaviour without overriding imitation.
+        l_lane = torch.tensor(0.0, device=pred_xy.device)
+        if lane_points is not None and lane_mask is not None:
+            B, T, _ = pred_xy.shape
+            M = lane_points.shape[1]
+            # (B, M, MAX_LANE_POINTS*2) -> (B, M, P, 2) -> (B, M*P, 2)
+            lp = lane_points.view(B, M, -1, 2)
+            P = lp.shape[2]
+            lp_flat = lp.reshape(B, M * P, 2)                       # (B, M*P, 2)
+            # Per-point validity: a lane's points are valid iff its mask is True.
+            pt_valid = lane_mask.unsqueeze(-1).expand(B, M, P).reshape(B, M * P)  # (B, M*P)
+
+            # Distance from each predicted waypoint to every lane point.
+            # pred_xy: (B, T, 2) -> (B, T, 1, 2); lp_flat: (B, 1, M*P, 2)
+            d = (pred_xy.unsqueeze(2) - lp_flat.unsqueeze(1)).norm(dim=-1)  # (B, T, M*P)
+            # Invalidate padded lane points.
+            d = d.masked_fill(~pt_valid.unsqueeze(1), float("inf"))
+            min_d = d.min(dim=2).values                              # (B, T)
+
+            # Samples with NO valid lanes produce inf -> exclude them from the term.
+            has_lane = torch.isfinite(min_d)                         # (B, T)
+            valid = waypoint_mask.bool() & has_lane
+            # Soft hinge beyond the band.
+            departure = F.relu(min_d - self.lane_band)
+            departure = torch.where(valid, departure, torch.zeros_like(departure))
+            denom = valid.float().sum().clamp(min=1)
+            l_lane = departure.sum() / denom
+
         # --- Total ---
         total = (
             self.w_traj * l_traj
@@ -107,6 +149,7 @@ class PlannerLoss(nn.Module):
             + self.w_velocity * l_velocity
             + self.w_meta * l_meta
             + self.w_coll * l_coll
+            + self.w_lane * l_lane
         )
 
         return {
@@ -116,4 +159,5 @@ class PlannerLoss(nn.Module):
             "velocity": l_velocity,
             "meta": l_meta,
             "collision": l_coll,
+            "lane": l_lane,
         }

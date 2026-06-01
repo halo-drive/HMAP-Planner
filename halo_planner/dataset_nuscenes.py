@@ -72,7 +72,11 @@ def compute_meta_action(future_traj: np.ndarray) -> int:
     if len(future_traj) < 2:
         return 0  # follow_lane
 
-    speed = np.linalg.norm(future_traj[-1, :2] - future_traj[0, :2]) / (len(future_traj) * 0.5)
+    # future_traj is the 10Hz interpolated trajectory (0.1s per step), so the
+    # elapsed time is len*0.1 s, NOT len*0.5. The old 0.5 divisor treated it as
+    # a 2Hz/20s trajectory and underestimated speed 5x, biasing toward `stop`.
+    elapsed = len(future_traj) * 0.1
+    speed = np.linalg.norm(future_traj[-1, :2] - future_traj[0, :2]) / max(elapsed, 1e-3)
     lateral = abs(future_traj[-1, 1] - future_traj[0, 1])
 
     if speed < 0.3:
@@ -195,6 +199,22 @@ class NuScenesDataset(Dataset):
 
         keyframes = np.array(keyframes, dtype=np.float32)  # (K, 4): t, x, y, hdg
 
+        # Compute speed at each KEYFRAME from 2Hz pose deltas, BEFORE interpolation.
+        # Differencing the interpolated 10Hz positions (the old approach) amplified
+        # interpolation noise and produced a garbage velocity label/head. Computing
+        # speed at the 0.5s keyframe spacing and then interpolating the speed as its
+        # own channel is far smoother and physically meaningful.
+        K = len(keyframes)
+        kf_t = keyframes[:, 0]
+        kf_xy = keyframes[:, 1:3]
+        kf_speed = np.zeros(K, dtype=np.float32)
+        # speed[0] from origin->first keyframe; speed[i] from (i-1)->i keyframe.
+        kf_speed[0] = np.linalg.norm(kf_xy[0]) / max(kf_t[0], 1e-3)
+        for i in range(1, K):
+            d = np.linalg.norm(kf_xy[i] - kf_xy[i - 1])
+            dt_kf = max(kf_t[i] - kf_t[i - 1], 1e-3)
+            kf_speed[i] = d / dt_kf
+
         # Interpolate to 10Hz
         dt_out = 1.0 / self.output_rate  # 0.1s
         t_out = np.arange(1, TRAJECTORY_STEPS + 1) * dt_out  # 0.1, 0.2, ..., 4.0
@@ -203,14 +223,8 @@ class NuScenesDataset(Dataset):
         x_interp = np.interp(t_out, keyframes[:, 0], keyframes[:, 1])
         y_interp = np.interp(t_out, keyframes[:, 0], keyframes[:, 2])
         hdg_interp = np.interp(t_out, keyframes[:, 0], keyframes[:, 3])
-
-        # Compute velocity from position differences
-        vel = np.zeros(TRAJECTORY_STEPS, dtype=np.float32)
-        vel[0] = np.sqrt(x_interp[0]**2 + y_interp[0]**2) / dt_out
-        for i in range(1, TRAJECTORY_STEPS):
-            dx = x_interp[i] - x_interp[i-1]
-            dy = y_interp[i] - y_interp[i-1]
-            vel[i] = np.sqrt(dx**2 + dy**2) / dt_out
+        # Interpolate the smooth keyframe SPEED, rather than differencing positions.
+        vel = np.interp(t_out, kf_t, kf_speed).astype(np.float32)
 
         waypoints = np.stack([x_interp, y_interp, hdg_interp, vel], axis=-1)
         return waypoints.astype(np.float32)  # (TRAJECTORY_STEPS, 4)

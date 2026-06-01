@@ -24,7 +24,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from halo_planner.model import HaloPlanner
+from halo_planner.model import HaloPlanner, MAX_LANE_POINTS 
 from halo_planner.losses import PlannerLoss
 from halo_planner.dataset_nuscenes import NuScenesDataset
 
@@ -77,6 +77,8 @@ def train_one_epoch(model, loader, criterion, optimiser, device, epoch, writer, 
             waypoint_mask=wp_mask,
             object_positions=objs[..., :2],
             object_mask=obj_mask,
+            lane_points=lanes[..., :MAX_LANE_POINTS * 2],   
+            lane_mask=lane_mask,                             
         )
 
         optimiser.zero_grad()
