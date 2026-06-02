@@ -391,7 +391,7 @@ def run_episode(env, model, device, args, controller_kind, dt, verbose=True):
     # Build the controller for this episode.
     hmap = None
     if controller_kind == "hmap":
-        hmap = HMAPController(env.agent, kp=args.kp,
+        hmap = HMAPController(env.agent,kp=0.1, ki=0.01, kd=0.0,cruise_speed=args.warmup_speed,
                               enable_rollout_check=args.rollout_check)
 
     total_distance = 0.0

@@ -255,10 +255,10 @@ class MetaActionGate:
     # Larger index = look further ahead = smoother/faster; smaller = tighter.
     LOOKAHEAD_IDX = {
         META_FOLLOW_LANE: 10,
-        META_LANE_CHANGE_LEFT: 14,
-        META_LANE_CHANGE_RIGHT: 14,
+        META_LANE_CHANGE_LEFT:12,
+        META_LANE_CHANGE_RIGHT: 12,
         META_STOP: 5,
-        META_YIELD: 7,
+        META_YIELD: 5,
         META_REVERSE: 5,
     }
 
@@ -330,18 +330,23 @@ class TrajectoryTracker:
     # ---- lateral ----------------------------------------------------------
     def _steering(self, waypoints: np.ndarray, idx: int, max_delta: float) -> float:
         tx, ty = float(waypoints[idx, 0]), float(waypoints[idx, 1])
+        
+        # 1. Base Pure Pursuit Steering
         delta = self.motion.pure_pursuit_delta(tx, ty)
 
-        # Heading feedforward: OFF by default (heading_ff_gain=0). The planner's
-        # theta channel was injecting a single-sign steering bias (drift off
-        # road). Until the theta convention is verified against the path tangent,
-        # steer on POSITION only — this is what the legacy controller did. Re-
-        # enable by passing heading_ff_gain>0 once theta is confirmed.
+        # 2. Heading Feedforward 
         if self.heading_ff_gain != 0.0:
             path_theta = float(waypoints[idx, 2])
-            delta = delta + self.heading_ff_gain * _wrap_angle(path_theta)
-        return float(np.clip(delta, -max_delta, max_delta))
+            delta = delta + (self.heading_ff_gain * _wrap_angle(path_theta))
 
+        # 3. Immediate Centering 
+        immediate_y = float(waypoints[2, 1])
+        #MUST BE NEGATIVE. If y is negative (right), -0.5 * y = positive (steer left!)
+        centering_correction = -0.2 * immediate_y  
+        delta = delta + centering_correction
+
+        return float(np.clip(delta, -max_delta, max_delta))
+    
     # ---- longitudinal -----------------------------------------------------
     def _target_speed(self, waypoints: np.ndarray, idx: int, sched: dict) -> float:
         # CRITICAL: target speed must NOT be derived from the planner's forward
@@ -393,13 +398,13 @@ class TrajectoryTracker:
         return float(np.clip(u, -1.0, 1.0))
 
     # ---- combined ---------------------------------------------------------
+    # ---- combined ---------------------------------------------------------
     def compute(self, waypoints: np.ndarray, sched: dict,
                 v_meas: float, max_delta: float, dt: float) -> list:
         n = len(waypoints)
         idx = int(np.clip(round(sched["lookahead_idx"]), 1, n - 1))
 
-        # Reverse guard: lock out forward motion, hold straight, command brake.
-        # (Forward waypoints + reverse meta = contradiction -> safe hold.)
+        # Reverse guard
         if sched["reverse"]:
             self.reset()
             return [0.0, -0.5]
@@ -407,11 +412,11 @@ class TrajectoryTracker:
         steering_rad = self._steering(waypoints, idx, max_delta)
         steering_norm = float(np.clip(steering_rad / max_delta, -1.0, 1.0))
 
+        # RESTORE THE PID CONTROLLER
         v_target = self._target_speed(waypoints, idx, sched)
         throttle = self._throttle(v_target, v_meas, dt)
 
         return [steering_norm, throttle]
-
 
 # ---------------------------------------------------------------------------
 # HMAPController — facade. One-line swap for waypoints_to_action().
@@ -436,13 +441,13 @@ class HMAPController:
     def __init__(self, agent, enable_rollout_check: bool = False,
                  grace_ticks: int = 8, v_max: float = 30.0,
                  kp: float = 0.2, ki: float = 0.05, kd: float = 0.1,
-                 cruise_speed: float = 12.0):
+                 cruise_speed: float = 12.0, heading_ff_gain: float = 1.2):
         wheelbase = agent.FRONT_WHEELBASE + agent.REAR_WHEELBASE
         max_delta = math.radians(agent.max_steering)
         self.motion = MotionModel(wheelbase, max_delta)
         self.gate = MetaActionGate()
         self.tracker = TrajectoryTracker(self.motion, kp=kp, ki=ki, kd=kd,
-                                         cruise_speed=cruise_speed)
+                                         cruise_speed=cruise_speed, heading_ff_gain=heading_ff_gain)
         self.sanity = PlannerSanityChecker(wheelbase, max_delta, v_max=v_max)
         self.max_delta = max_delta
         self.enable_rollout_check = enable_rollout_check
@@ -493,7 +498,22 @@ class HMAPController:
         if self.enable_rollout_check:
             self._last_divergence = self._rollout_divergence(active_wp, action, v_meas)
 
+        # --- TEMPORARY AEB (Autonomous Emergency Braking) ---
+        if v_meas > 0.5:
+            if hasattr(agent, "engine") and hasattr(agent.engine, "traffic_manager"):
+                tm = agent.engine.traffic_manager
+                for vid, vehicle in tm.spawned_objects.items():
+                    if vehicle is agent:
+                        continue  # Don't brake for ourselves
+                    
+                    # Simple radius check
+                    dist = np.linalg.norm(np.array(agent.position) - np.array(vehicle.position))
+                    if dist < 8.0:
+                        action[1] = -1.0  # Slam the brakes!
+                        break
+                        
         return action
+       
 
     @property
     def last_verdict(self) -> tuple:
