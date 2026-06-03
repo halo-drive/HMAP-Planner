@@ -90,26 +90,26 @@ class PlannerLoss(nn.Module):
         # --- Meta-action classification ---
         l_meta = F.cross_entropy(pred_meta, gt_meta)
 
-        # --- Collision penalty (optional) ---
+        # --- Collision penalty  ---
         l_coll = torch.tensor(0.0, device=pred_xy.device)
         if object_positions is not None and object_mask is not None:
             # Distance from each predicted waypoint to nearest object
             # pred_xy: (B, T, 2), obj_pos: (B, N, 2)
-            diff = pred_xy.unsqueeze(2) - object_positions.unsqueeze(1)  # (B, T, N, 2)
-            dist = diff.norm(dim=-1)  # (B, T, N)
+            diff = pred_xy.unsqueeze(2) - object_positions.unsqueeze(1)  #(B, T, N, 2)
+            dist = diff.norm(dim=-1)  #(B, T, N)
 
             # Mask out invalid objects
             dist = dist.masked_fill(~object_mask.unsqueeze(1), float("inf"))
 
             # Min distance per waypoint
-            min_dist = dist.min(dim=2).values  # (B, T)
+            min_dist = dist.min(dim=2).values  #(B, T)
 
             # Penalise waypoints closer than 2m to any object
             collision_margin = 2.0
             violation = F.relu(collision_margin - min_dist)  # 0 if far, positive if close
             l_coll = (violation * waypoint_mask).sum() / waypoint_mask.sum().clamp(min=1)
 
-        # --- Lane-keeping penalty (optional) ---
+        # --- Lane-keeping penalty  ---
         # Penalise predicted waypoints that stray far from the nearest lane
         # centerline point. Soft hinge: zero within `lane_band` metres, linear
         # beyond. Distance is to the nearest of ALL valid lane points (no lane

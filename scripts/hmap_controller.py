@@ -152,7 +152,7 @@ class PlannerSanityChecker:
             wp[:, 3] = np.clip(v, 0.0, self.v_max)
             # intentionally not setting clamped/reasons for velocity
 
-        # --- feasibility: curvature (DIAGNOSTIC ONLY — does not rewrite theta) ---
+        # --- feasibility: curvature (does not rewrite theta) ---
         # NOTE: the previous version reconstructed the heading channel by
         # integrating a clamped curvature forward. That was harmful: it (a)
         # accumulated a monotonic, single-sign heading error along the 40 wps,

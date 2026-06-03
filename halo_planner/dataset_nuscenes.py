@@ -22,7 +22,7 @@ from .model import (
     NUM_META_ACTIONS,
 )
 
-# nuScenes class name → classId (matching FusedPacket convention)
+# nuScenes class name  classId (matching FusedPacket convention)
 NUSCENES_CLASS_MAP = {
     "car": 0, "truck": 0, "bus": 0, "trailer": 0,
     "construction_vehicle": 0,
@@ -233,7 +233,7 @@ class NuScenesDataset(Dataset):
                 yaw,
                 class_onehot[0], class_onehot[1], class_onehot[2],
                 1.0, 1.0, 1.0, 1.0,
-                vel_x, vel_y,  # <--- True velocities injected!
+                vel_x, vel_y,  # real velocity injection
             ]
             mask[count] = True
             count += 1
