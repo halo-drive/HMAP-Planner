@@ -46,7 +46,7 @@ from halo_planner.model import (
 # HMAP Controller — kinematic trajectory controller (drop next to this script,
 # or anywhere on PYTHONPATH).
 from hmap_controller import HMAPController
-
+from arbitrator import TrajectoryArbitrator
 
 # ---------------------------------------------------------------------------
 # Coordinate transform (world → ego frame)
@@ -391,8 +391,8 @@ def run_episode(env, model, device, args, controller_kind, dt, verbose=True):
     # Build the controller for this episode.
     hmap = None
     if controller_kind == "hmap":
-        hmap = HMAPController(env.agent,kp=0.1, ki=0.01, kd=0.0,cruise_speed=args.warmup_speed,
-                              enable_rollout_check=args.rollout_check)
+        hmap = HMAPController(env.agent, kp=0.1, ki=0.01, kd=0.0, cruise_speed=args.warmup_speed)
+        arbitrator = TrajectoryArbitrator(ttc_threshold=1.5, lateral_jump_limit=0.5)
 
     total_distance = 0.0
     total_reward = 0.0
@@ -420,9 +420,23 @@ def run_episode(env, model, device, args, controller_kind, dt, verbose=True):
                 dt_inf = time.time() - t0
                 inference_times.append(dt_inf * 1000)
 
-            current_waypoints = out["waypoints"][0].cpu().numpy()  # (40, 4)
-            current_meta_logits = out["meta_logits"][0].cpu().numpy()  # (6,)
+            raw_wp = out["waypoints"][0].cpu().numpy()  # (40, 4)
+            raw_meta = out["meta_logits"][0].cpu().numpy()  # (6,)
             plan_count += 1
+            
+            if controller_kind == "hmap":
+                safe_plan = arbitrator.arbitrate(raw_wp, raw_meta, env.agent)
+                current_waypoints = safe_plan["waypoints"]
+                current_meta_logits = safe_plan["meta_logits"]
+                
+                # Diagnostic printing
+                if safe_plan["aeb_triggered"]:
+                    print(f"  [ARBITRATOR] AEB TRIGGERED at step {step}! TTC < 1.5s")
+                if safe_plan["cte"] > 0.3:
+                    print(f"  [ARBITRATOR] HIGH CTE: {safe_plan['cte']:.2f}m. Model hallucinating?")
+            else:
+                current_waypoints = raw_wp
+                current_meta_logits = raw_meta
 
             # --- Debug-frame dump: inputs the planner SAW + outputs it PRODUCED.
             # Settles plumbing-bug vs closed-loop-gap. Dumps the first few plans.

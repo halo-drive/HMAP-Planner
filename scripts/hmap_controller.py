@@ -254,9 +254,9 @@ class MetaActionGate:
     # Per-meta-action nominal lookahead index into the 40-waypoint array.
     # Larger index = look further ahead = smoother/faster; smaller = tighter.
     LOOKAHEAD_IDX = {
-        META_FOLLOW_LANE: 10,
-        META_LANE_CHANGE_LEFT:12,
-        META_LANE_CHANGE_RIGHT: 12,
+        META_FOLLOW_LANE: 8,
+        META_LANE_CHANGE_LEFT:10,
+        META_LANE_CHANGE_RIGHT: 10,
         META_STOP: 5,
         META_YIELD: 5,
         META_REVERSE: 5,
@@ -460,6 +460,11 @@ class HMAPController:
         self._last_verdict = "ok"
         self._last_reason = ""
 
+        # action cache
+        self.last_action = [0.0, 0.0]
+        self.steer_alpha = 0.4
+        self.throttle_alpha = 0.5
+
     def reset(self):
         self.tracker.reset()
         self._last_good_wp = None
@@ -493,12 +498,16 @@ class HMAPController:
             self._last_good_wp = active_wp
             self._reject_streak = 0
 
-        action = self.tracker.compute(active_wp, sched, v_meas, self.max_delta, dt)
+        raw_action = self.tracker.compute(active_wp, sched, v_meas, self.max_delta, dt)
+        
+        smooth_steer = self.steer_alpha * raw_action[0] + ((1 - self.steer_alpha) * self.last_action[0])    
+        smooth_throttle = self.throttle_alpha * raw_action[1] + ((1 - self.throttle_alpha) * self.last_action[1])
+        action = [smooth_steer, smooth_throttle]
+        self.last_action = action
 
         if self.enable_rollout_check:
             self._last_divergence = self._rollout_divergence(active_wp, action, v_meas)
 
-        # --- TEMPORARY AEB (Autonomous Emergency Braking) ---
         if v_meas > 0.5:
             if hasattr(agent, "engine") and hasattr(agent.engine, "traffic_manager"):
                 tm = agent.engine.traffic_manager
@@ -510,6 +519,7 @@ class HMAPController:
                     dist = np.linalg.norm(np.array(agent.position) - np.array(vehicle.position))
                     if dist < 8.0:
                         action[1] = -1.0  # Slam the brakes!
+                        self.last_action[1] = -1.0  # Update cache to avoid smoothing out the emergency brake in subsequent steps
                         break
                         
         return action

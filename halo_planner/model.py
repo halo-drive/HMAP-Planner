@@ -294,7 +294,15 @@ class TrajectoryDecoder(nn.Module):
         )  # (B, T, d_model)
 
         # Regress waypoints
-        waypoints = self.waypoint_head(decoded)  # (B, T, 4)
+        raw_output = self.waypoint_head(decoded)  # (B, T, 4)
+
+        dx = raw_output[..., 0]
+        dy = raw_output[..., 1]
+
+        x = torch.cumsum(dx, dim=1)  # Integrate deltas to get absolute position
+        y = torch.cumsum(dy, dim=1)
+
+        waypoints = torch.stack([x, y, raw_output[..., 2], raw_output[..., 3]], dim=-1)
 
         # Meta-action: pool all decoded tokens
         pooled = decoded.mean(dim=1)             # (B, d_model)
