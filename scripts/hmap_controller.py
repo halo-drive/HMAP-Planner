@@ -254,12 +254,12 @@ class MetaActionGate:
     # Per-meta-action nominal lookahead index into the 40-waypoint array.
     # Larger index = look further ahead = smoother/faster; smaller = tighter.
     LOOKAHEAD_IDX = {
-        META_FOLLOW_LANE: 8,
-        META_LANE_CHANGE_LEFT:10,
-        META_LANE_CHANGE_RIGHT: 10,
-        META_STOP: 5,
-        META_YIELD: 5,
-        META_REVERSE: 5,
+        META_FOLLOW_LANE: 15,
+        META_LANE_CHANGE_LEFT: 8,
+        META_LANE_CHANGE_RIGHT: 8,
+        META_STOP: 4,
+        META_YIELD: 4,
+        META_REVERSE: 4,
     }
 
     # Probability above which a guard activates.
