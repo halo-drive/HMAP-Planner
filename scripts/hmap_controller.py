@@ -392,10 +392,12 @@ class TrajectoryTracker:
     def _throttle(self, v_target: float, v_meas: float, dt: float) -> float:
         err = v_target - v_meas
         self._int += err * dt
+        # added a new v_target - v_mess 
+        # this differential makes the most sense to calculate the throttle values 
         self._int = float(np.clip(self._int, -5.0, 5.0))  # anti-windup
         deriv = (err - self._prev_err) / max(dt, 1e-3)
         self._prev_err = err
-
+        # kp - proportional gain ; kd - derivative gain ; ki = integral gain 
         u = self.kp * err + self.ki * self._int + self.kd * deriv
         # Map PID output to MetaDrive's single throttle/brake axis [-1, 1].
         return float(np.clip(u, -1.0, 1.0))
